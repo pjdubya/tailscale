@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/asaskevich/govalidator"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -26,7 +27,7 @@ var synologyConfigureCertCmd = &ffcli.Command{
 	Name:       "synology-cert",
 	Exec:       runConfigureSynologyCert,
 	ShortHelp:  "Configure Synology with a TLS certificate for your tailnet",
-	ShortUsage: "synology-cert [--domain <domain>]",
+	ShortUsage: "synology-cert [--domain <domain> -sans <comma separated sans>]",
 	LongHelp: strings.TrimSpace(`
 This command is intended to run periodically as root on a Synology device to
 create or refresh the TLS certificate for the tailnet domain.
@@ -35,13 +36,15 @@ See: https://tailscale.com/kb/1153/enabling-https
 `),
 	FlagSet: (func() *flag.FlagSet {
 		fs := newFlagSet("synology-cert")
-		fs.StringVar(&synologyConfigureCertArgs.domain, "domain", "", "Tailnet domain to create or refresh certificates for. Ignored if only one domain exists.")
+		fs.StringVar(&synologyConfigureCertArgs.domain, "domain", "", "Tailnet domain for which to create or refresh certificates. Ignored if only one domain exists.")
+		fs.StringVar(&synologyConfigureCertArgs.domain, "sans", "", "Subject Alternative Names to include for this domain. Comma separated list.")
 		return fs
 	})(),
 }
 
 var synologyConfigureCertArgs struct {
 	domain string
+	sans   string
 }
 
 func runConfigureSynologyCert(ctx context.Context, args []string) error {
@@ -62,6 +65,7 @@ func runConfigureSynologyCert(ctx context.Context, args []string) error {
 	}
 
 	domain := synologyConfigureCertArgs.domain
+	sans := synologyConfigureCertArgs.sans
 	if st, err := localClient.Status(ctx); err == nil {
 		if st.BackendState != ipn.Running.String() {
 			return fmt.Errorf("Tailscale is not running.")
@@ -72,7 +76,16 @@ func runConfigureSynologyCert(ctx context.Context, args []string) error {
 				log.Printf("Ignoring supplied domain %q, TLS certificate will be created for %q.\n", domain, st.CertDomains[0])
 			}
 			domain = st.CertDomains[0]
+			// check that if sans is provided, it must be a set of comma separated strings that follow DNS name rules
+			if sans != "" {
+				for _, san := range strings.Split(sans, ",") {
+					if !govalidator.IsDNSName(san) {
+						return fmt.Errorf("Subject Alternative Name %q is not a valid domain name.", san)
+					}
+				}
+			}
 		} else {
+			// whem would this get executed?
 			var found bool
 			for _, d := range st.CertDomains {
 				if d == domain {
@@ -97,6 +110,12 @@ func runConfigureSynologyCert(ctx context.Context, args []string) error {
 			id = c.ID
 			break
 		}
+	}
+
+	// SANs were validated as permissable domain names above so we can just append them to the domain for handling by the API.
+	// letsencrypt will set CN to the first domain in the domain list, and will set SAN for each subsequent domain
+	if sans != "" {
+		domain += "," + sans
 	}
 
 	certPEM, keyPEM, err := localClient.CertPair(ctx, domain)
